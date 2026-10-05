@@ -17,7 +17,7 @@ class OptionalDependencyTests(unittest.TestCase):
         )
         script = (
             "import importlib, json, sys; import tracelet; "
-            "optional = {'boto3', 'sqlalchemy', 'fastapi', 'openai', 'anthropic'}; "
+            "optional = {'boto3', 'sqlalchemy', 'httpx', 'fastapi', 'openai', 'anthropic'}; "
             "print(json.dumps(sorted(optional.intersection(sys.modules))))"
         )
 

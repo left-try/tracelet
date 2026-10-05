@@ -16,6 +16,7 @@ dependencies = []
 fastapi = ["fastapi>=0.100"]
 s3 = ["boto3>=1.28"]
 sql = ["SQLAlchemy>=2.0"]
+d1 = ["httpx>=0.27"]
 local-nli = ["transformers>=4.40", "torch>=2.1"]
 test = ["pytest>=8"]
 
