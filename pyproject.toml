@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tracelet-evals"
+version = "0.1.0"
+description = "In-process evaluation capture and background scoring for LLM applications"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Tracelet contributors" }]
+dependencies = []
+
+[project.optional-dependencies]
+fastapi = ["fastapi>=0.100"]
+s3 = ["boto3>=1.28"]
+sql = ["SQLAlchemy>=2.0"]
+local-nli = ["transformers>=4.40", "torch>=2.1"]
+test = ["pytest>=8"]
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
