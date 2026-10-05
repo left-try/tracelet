@@ -20,6 +20,7 @@ from .judge import EvaluationPipeline, LLMJudge
 from .redaction import RedactionPolicy
 from .result import EvaluationResult
 from .storage.files import FileStore
+from .storage.cloudflare_d1 import CloudflareD1Store
 from .storage.protocol import StorageAdapter, validate_storage_adapter
 from .storage.sqlalchemy import SQLAlchemyStore
 from .storage.s3 import S3DrainWorker, S3Sink
@@ -40,6 +41,7 @@ def attach_worker(app, worker):
 
 __all__ = [
     "CandidateRunner",
+    "CloudflareD1Store",
     "EvaluationPipeline",
     "EvaluationResult",
     "EvaluationWorker",
