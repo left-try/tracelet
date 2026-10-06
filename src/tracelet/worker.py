@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
+import json
 import time
 import uuid
 from dataclasses import asdict, is_dataclass
@@ -9,8 +11,9 @@ from types import SimpleNamespace
 from typing import Any, Callable
 
 from .errors import WorkerClosedError
+from .context import EvaluationContext
 from .event import Event
-from .evaluator import evaluate
+from .evaluator import evaluate, evaluate_with_context
 from .storage.protocol import call_storage
 
 
@@ -137,6 +140,7 @@ class EvaluationWorker:
                 if "result_checkpoint" in job:
                     serialized_result = job["result_checkpoint"]
                 else:
+                    contextual_target = self._contextual_target(self.evaluator)
                     if "evaluators" in payload:
                         selected = []
                         for name in payload["evaluators"]:
@@ -144,9 +148,17 @@ class EvaluationWorker:
                                 selected.append(self.evaluators[name])
                             except KeyError as exc:
                                 raise ValueError(f"evaluator {name!r} is not registered") from exc
-                        call = evaluate(event, selected)
+                        self._require_evaluator_checkpoint_store()
+                        call = evaluate_with_context(event, selected, self._evaluation_context(job_id, "registry"))
                     elif self.evaluator is None:
-                        call = evaluate(event, self.evaluators.values())
+                        self._require_evaluator_checkpoint_store()
+                        call = evaluate_with_context(
+                            event, self.evaluators.values(), self._evaluation_context(job_id, "registry")
+                        )
+                    elif contextual_target is not None:
+                        self._require_evaluator_checkpoint_store()
+                        context = self._evaluation_context(job_id, "root")
+                        call = contextual_target(event, context=context)
                     else:
                         call = self.evaluator(event)
                     if self.timeout is not None:
@@ -172,9 +184,8 @@ class EvaluationWorker:
                             "pairwise": pairwise,
                         }
                     serialized_result = _serialize_result(result)
+                    await call_storage(self.store, "checkpoint", job_id, result=serialized_result)
                 if self.archive_store is not None:
-                    if "result_checkpoint" not in job:
-                        await call_storage(self.store, "checkpoint", job_id, result=serialized_result)
                     await call_storage(
                         self.archive_store,
                         "enqueue",
@@ -199,6 +210,48 @@ class EvaluationWorker:
                     await asyncio.sleep(min(0.01 * (2 ** max(0, attempts - 1)), 0.5))
                 else:
                     await call_storage(self.store, "fail", job_id, error=str(exc), retryable=False)
+
+    @staticmethod
+    def _contextual_target(evaluator):
+        target = evaluator
+        method = getattr(target, "evaluate_with_context", None)
+        if callable(method):
+            return method
+        owner = getattr(evaluator, "__self__", None)
+        method = getattr(owner, "evaluate_with_context", None)
+        return method if callable(method) else None
+
+    def _require_evaluator_checkpoint_store(self):
+        missing = [
+            name for name in ("get_evaluator_checkpoints", "checkpoint_evaluator")
+            if not callable(getattr(self.store, name, None))
+        ]
+        if missing:
+            raise TypeError(
+                "context-aware evaluation requires storage methods: " + ", ".join(missing)
+            )
+
+    def _evaluation_context(self, job_id: str, slot_path: str) -> EvaluationContext:
+        key = hashlib.sha256(
+            json.dumps(["tracelet-evaluator-v1", job_id, slot_path], ensure_ascii=False,
+                       separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+
+        async def load_checkpoint():
+            checkpoints = await call_storage(self.store, "get_evaluator_checkpoints", job_id)
+            return checkpoints.get(key)
+
+        async def save_checkpoint(result):
+            await call_storage(
+                self.store, "checkpoint_evaluator", job_id, key, result=_serialize_result(result)
+            )
+
+        return EvaluationContext(
+            key,
+            load_checkpoint=load_checkpoint,
+            save_checkpoint=save_checkpoint,
+            slot_factory=lambda child: self._evaluation_context(job_id, f"{slot_path}/{child}"),
+        )
 
     @staticmethod
     def _event(raw):

@@ -5,6 +5,67 @@ from tests._support import public_symbol
 
 
 class JudgePipelineTests(unittest.TestCase):
+    def test_worker_resumes_pipeline_slots_with_stable_distinct_idempotency_keys(self):
+        Event = public_symbol("Event")
+        EvaluationPipeline = public_symbol("EvaluationPipeline")
+        EvaluationWorker = public_symbol("EvaluationWorker")
+        FileStore = public_symbol("FileStore")
+        import tempfile
+        from pathlib import Path
+
+        class FailSecondCheckpointOnce:
+            def __init__(self, store):
+                self.store = store
+                self.writes = 0
+                self.failed = False
+
+            def __getattr__(self, name):
+                return getattr(self.store, name)
+
+            def checkpoint_evaluator(self, job_id, evaluator_key, *, result):
+                self.writes += 1
+                if self.writes == 2 and not self.failed:
+                    self.failed = True
+                    raise RuntimeError("checkpoint interrupted")
+                return self.store.checkpoint_evaluator(job_id, evaluator_key, result=result)
+
+        class ContextAware:
+            name = "same-name"
+            version = "1"
+
+            def __init__(self):
+                self.calls = 0
+                self.keys = []
+
+            async def evaluate_with_context(self, event, *, context):
+                self.calls += 1
+                self.keys.append(context.idempotency_key)
+                return {"score_type": "boolean", "score": True}
+
+        first, second = ContextAware(), ContextAware()
+
+        async def scenario(directory):
+            base = FileStore(Path(directory))
+            store = FailSecondCheckpointOnce(base)
+            pipeline = EvaluationPipeline(deterministic=[first, second])
+            worker = EvaluationWorker(store=store, evaluator=pipeline.run, max_attempts=3, poll_interval=0.002)
+            await worker.enqueue(Event(request_id="resume-pipeline", input="q", output="a"))
+            await worker.start()
+            await worker.wait_idle(timeout=2)
+            await worker.stop()
+            return base.get("resume-pipeline")
+
+        with tempfile.TemporaryDirectory() as directory:
+            record = asyncio.run(scenario(directory))
+
+        self.assertEqual(record["status"], "completed")
+        self.assertEqual(first.calls, 1)
+        self.assertEqual(second.calls, 2)
+        self.assertEqual(len(set(first.keys)), 1)
+        self.assertEqual(len(set(second.keys)), 1)
+        self.assertNotEqual(first.keys[0], second.keys[0])
+        self.assertEqual(second.keys[0], second.keys[1])
+
     def test_observed_cost_ceiling_skips_later_judge_calls(self):
         Event = public_symbol("Event")
         EvaluationPipeline = public_symbol("EvaluationPipeline")
