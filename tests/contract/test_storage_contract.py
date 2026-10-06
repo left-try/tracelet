@@ -6,6 +6,27 @@ from tests._support import public_symbol
 
 
 class StorageContractTests(unittest.TestCase):
+    def test_file_store_checkpoints_evaluator_results_until_terminal_transition(self):
+        FileStore = public_symbol("FileStore")
+        with tempfile.TemporaryDirectory() as directory:
+            store = FileStore(Path(directory))
+            store.enqueue("slot-job", {"input": "hello"})
+
+            self.assertEqual(store.get_evaluator_checkpoints("slot-job"), {})
+            with self.assertRaises(KeyError):
+                store.checkpoint_evaluator("slot-job", "slot-0", result={"score": True})
+
+            store.claim("slot-job", worker_id="worker")
+            store.checkpoint_evaluator("slot-job", "slot-0", result={"score": True})
+            self.assertEqual(store.get_evaluator_checkpoints("slot-job"), {"slot-0": {"score": True}})
+            store.release("slot-job")
+            restarted = FileStore(Path(directory))
+            self.assertEqual(restarted.get_evaluator_checkpoints("slot-job"), {"slot-0": {"score": True}})
+
+            restarted.claim("slot-job", worker_id="worker-2")
+            restarted.complete("slot-job", result=[])
+            self.assertEqual(restarted.get_evaluator_checkpoints("slot-job"), {})
+
     def test_adapter_validation_requires_every_worker_operation(self):
         validate = public_symbol("validate_storage_adapter")
 

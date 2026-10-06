@@ -2,6 +2,7 @@
 
 from .api import Tracelet
 from .comparison import CandidateRunner, PairwiseEvaluator
+from .context import EvaluationContext
 from .event import Event
 from .evaluator import Evaluator, evaluate
 from .evaluators import (
@@ -43,6 +44,7 @@ __all__ = [
     "CandidateRunner",
     "CloudflareD1Store",
     "EvaluationPipeline",
+    "EvaluationContext",
     "EvaluationResult",
     "EvaluationWorker",
     "Event",

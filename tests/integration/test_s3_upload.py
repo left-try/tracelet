@@ -30,11 +30,15 @@ class S3UploadIntegrationTests(unittest.TestCase):
             client.create_bucket(Bucket=bucket)
         sink = S3Sink(client=client, bucket=bucket, prefix="tracelet-tests")
 
-        asyncio.run(sink.write(job_id="integration-record", record={"schema_version": 1, "score": True}))
+        secret = "api_key=integration-secret-value"
+        asyncio.run(sink.write(job_id="integration-record", record={
+            "schema_version": 1, "score": True, "details": secret,
+        }))
 
         response = client.get_object(Bucket=bucket, Key="tracelet-tests/integration-record.json")
         body = response["Body"].read().decode()
         self.assertIn('"score": true', body)
+        self.assertNotIn("integration-secret-value", body)
 
 
 if __name__ == "__main__":

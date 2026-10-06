@@ -5,6 +5,25 @@ from tests._support import public_symbol
 
 
 class S3SinkTests(unittest.TestCase):
+    def test_s3_sink_redacts_nested_secrets_before_upload(self):
+        S3Sink = public_symbol("S3Sink")
+
+        class S3Client:
+            def __init__(self):
+                self.calls = []
+
+            async def put_object(self, **kwargs):
+                self.calls.append(kwargs)
+
+        client = S3Client()
+        secret = "password=archive-secret-value"
+        sink = S3Sink(client=client, bucket="archive")
+        asyncio.run(sink.write(job_id="sensitive", record={"details": [secret]}))
+
+        body = client.calls[0]["Body"].decode()
+        self.assertNotIn("archive-secret-value", body)
+        self.assertIn("[REDACTED]", body)
+
     def test_sync_s3_client_runs_off_event_loop(self):
         import time
         S3Sink = public_symbol("S3Sink")

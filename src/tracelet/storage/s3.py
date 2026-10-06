@@ -5,23 +5,26 @@ import json
 import asyncio
 import uuid
 
+from ..redaction import RedactionPolicy
 from .protocol import call_storage
 
 
 class S3Sink:
     """Write evaluation records to stable S3-compatible object keys."""
 
-    def __init__(self, *, client, bucket: str, prefix: str = ""):
+    def __init__(self, *, client, bucket: str, prefix: str = "", redaction: RedactionPolicy | None = None):
         self.client = client
         self.bucket = bucket
         self.prefix = prefix.strip("/")
+        self.redaction = redaction or RedactionPolicy()
 
     def object_key(self, job_id: str) -> str:
         name = f"{job_id}.json"
         return f"{self.prefix}/{name}" if self.prefix else name
 
     async def write(self, *, job_id: str, record: dict) -> None:
-        body = json.dumps(record, ensure_ascii=False, allow_nan=False).encode("utf-8")
+        sanitized = self.redaction.apply(record) if isinstance(record, dict) else self.redaction.sanitize(record)
+        body = json.dumps(sanitized, ensure_ascii=False, allow_nan=False).encode("utf-8")
         call = self.client.put_object
         kwargs = {"Bucket": self.bucket, "Key": self.object_key(job_id),
                   "Body": body, "ContentType": "application/json"}
@@ -39,10 +42,14 @@ class S3Sink:
         try:
             await self.write(job_id=job_id, record=job["payload"])
         except Exception as exc:
+            try:
+                error = self.redaction.sanitize(str(exc))
+            except Exception:
+                error = "S3 delivery failed; redaction unavailable"
             if hasattr(store, "defer"):
-                await call_storage(store, "defer", job_id, error=str(exc))
+                await call_storage(store, "defer", job_id, error=error)
             else:
-                await call_storage(store, "retry", job_id, error=str(exc))
+                await call_storage(store, "retry", job_id, error=error)
             raise
         await call_storage(store, "complete", job_id, result={"object_key": self.object_key(job_id)})
 

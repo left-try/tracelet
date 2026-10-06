@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
+import json
 import time
 import uuid
 from dataclasses import asdict, is_dataclass
@@ -9,8 +11,10 @@ from types import SimpleNamespace
 from typing import Any, Callable
 
 from .errors import WorkerClosedError
+from .context import EvaluationContext
 from .event import Event
-from .evaluator import evaluate
+from .evaluator import evaluate, evaluate_with_context
+from .redaction import RedactionPolicy
 from .storage.protocol import call_storage
 
 
@@ -50,6 +54,7 @@ class EvaluationWorker:
         max_attempts: int = 3,
         poll_interval: float = 0.05,
         timeout: float | None = None,
+        redaction: RedactionPolicy | None = None,
     ):
         if evaluator is None and not evaluators:
             raise ValueError("provide evaluator or a non-empty evaluator registry")
@@ -72,6 +77,7 @@ class EvaluationWorker:
         self.max_attempts = max_attempts
         self.poll_interval = max(0.001, poll_interval)
         self.timeout = timeout
+        self.redaction = redaction or RedactionPolicy()
         self.worker_id = str(uuid.uuid4())
         self._runner: asyncio.Task | None = None
         self._tasks: set[asyncio.Task] = set()
@@ -92,10 +98,10 @@ class EvaluationWorker:
         if self._stopping:
             raise WorkerClosedError("worker has stopped")
         if isinstance(event, Event):
-            payload = {"event": event.to_dict()}
+            payload = {"event": event.to_dict(redaction=self.redaction)}
             job_id = job_id or event.request_id
         else:
-            payload = event
+            payload = self.redaction.apply(event)
             job_id = job_id or event.get("request_id") or str(uuid.uuid4())
         await call_storage(self.store, "enqueue", job_id=job_id, payload=payload)
         self._wake.set()
@@ -133,10 +139,14 @@ class EvaluationWorker:
                 job = await call_storage(self.store, "get", job_id)
                 payload = job["payload"]
                 raw_event = payload.get("event", payload) if isinstance(payload, dict) else payload
+                raw_event = self.redaction.apply(raw_event) if isinstance(raw_event, dict) else self.redaction.sanitize(raw_event)
                 event = self._event(raw_event)
                 if "result_checkpoint" in job:
-                    serialized_result = job["result_checkpoint"]
+                    serialized_result = self._redact_serialized(job["result_checkpoint"])
                 else:
+                    contextual_target = self._contextual_target(self.evaluator)
+                    context = None
+                    cached_context_result = None
                     if "evaluators" in payload:
                         selected = []
                         for name in payload["evaluators"]:
@@ -144,15 +154,29 @@ class EvaluationWorker:
                                 selected.append(self.evaluators[name])
                             except KeyError as exc:
                                 raise ValueError(f"evaluator {name!r} is not registered") from exc
-                        call = evaluate(event, selected)
+                        self._require_evaluator_checkpoint_store()
+                        call = evaluate_with_context(event, selected, self._evaluation_context(job_id, "registry"))
                     elif self.evaluator is None:
-                        call = evaluate(event, self.evaluators.values())
+                        self._require_evaluator_checkpoint_store()
+                        call = evaluate_with_context(
+                            event, self.evaluators.values(), self._evaluation_context(job_id, "registry")
+                        )
+                    elif contextual_target is not None:
+                        self._require_evaluator_checkpoint_store()
+                        root_name, root_version = self._evaluator_identity(self.evaluator)
+                        context = self._evaluation_context(job_id, f"root:{root_name}:{root_version}")
+                        cached_context_result = await context.load_checkpoint()
+                        call = None if cached_context_result is not None else contextual_target(event, context=context)
                     else:
                         call = self.evaluator(event)
-                    if self.timeout is not None:
+                    if cached_context_result is not None:
+                        result = cached_context_result
+                    elif self.timeout is not None:
                         result = await asyncio.wait_for(call, timeout=self.timeout) if inspect.isawaitable(call) else call
                     else:
                         result = await call if inspect.isawaitable(call) else call
+                    if context is not None and cached_context_result is None:
+                        await context.save_checkpoint(_serialize_result(result))
                     if self.candidate_runner is not None:
                         comparison = await self.candidate_runner.run(event)
                         pairwise = []
@@ -171,34 +195,98 @@ class EvaluationWorker:
                             "comparison": comparison,
                             "pairwise": pairwise,
                         }
-                    serialized_result = _serialize_result(result)
+                    serialized_result = self._redact_serialized(_serialize_result(result))
+                    await call_storage(self.store, "checkpoint", job_id, result=serialized_result)
                 if self.archive_store is not None:
-                    if "result_checkpoint" not in job:
-                        await call_storage(self.store, "checkpoint", job_id, result=serialized_result)
+                    archive_payload = self.redaction.apply({
+                        "schema_version": 1,
+                        "source_job_id": job_id,
+                        "request_id": getattr(event, "request_id", job_id),
+                        "event": _serialize_result(raw_event),
+                        "result": serialized_result,
+                    })
                     await call_storage(
                         self.archive_store,
                         "enqueue",
                         job_id=f"tracelet-eval:{job_id}",
-                        payload={
-                            "schema_version": 1,
-                            "source_job_id": job_id,
-                            "request_id": getattr(event, "request_id", job_id),
-                            "event": _serialize_result(raw_event),
-                            "result": serialized_result,
-                        },
+                        payload=archive_payload,
                     )
                 await call_storage(self.store, "complete", job_id, result=serialized_result)
             except asyncio.CancelledError:
                 await call_storage(self.store, "release", job_id)
                 raise
             except Exception as exc:
+                try:
+                    error = self.redaction.sanitize(str(exc))
+                except Exception:
+                    error = "evaluation failed; redaction unavailable"
                 job = await call_storage(self.store, "get", job_id) or {}
                 attempts = int(job.get("attempts", 0)) + 1
                 if attempts < self.max_attempts:
-                    await call_storage(self.store, "retry", job_id, error=str(exc))
+                    await call_storage(self.store, "retry", job_id, error=error)
                     await asyncio.sleep(min(0.01 * (2 ** max(0, attempts - 1)), 0.5))
                 else:
-                    await call_storage(self.store, "fail", job_id, error=str(exc), retryable=False)
+                    await call_storage(self.store, "fail", job_id, error=error, retryable=False)
+
+    @staticmethod
+    def _contextual_target(evaluator):
+        target = evaluator
+        method = getattr(target, "evaluate_with_context", None)
+        if callable(method):
+            return method
+        owner = getattr(evaluator, "__self__", None)
+        method = getattr(owner, "evaluate_with_context", None)
+        return method if callable(method) else None
+
+    def _redact_serialized(self, value):
+        if isinstance(value, dict):
+            return self.redaction.apply(value)
+        if isinstance(value, list):
+            return [self._redact_serialized(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(self._redact_serialized(item) for item in value)
+        return self.redaction.sanitize(value)
+
+    @staticmethod
+    def _evaluator_identity(evaluator):
+        owner = getattr(evaluator, "__self__", None)
+        target = owner if owner is not None else evaluator
+        name = getattr(target, "name", getattr(evaluator, "__name__", type(target).__name__))
+        version = str(getattr(target, "version", "1"))
+        return name, version
+
+    def _require_evaluator_checkpoint_store(self):
+        missing = [
+            name for name in ("get_evaluator_checkpoints", "checkpoint_evaluator")
+            if not callable(getattr(self.store, name, None))
+        ]
+        if missing:
+            raise TypeError(
+                "context-aware evaluation requires storage methods: " + ", ".join(missing)
+            )
+
+    def _evaluation_context(self, job_id: str, slot_path: str) -> EvaluationContext:
+        key = hashlib.sha256(
+            json.dumps(["tracelet-evaluator-v1", job_id, slot_path], ensure_ascii=False,
+                       separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+
+        async def load_checkpoint():
+            checkpoints = await call_storage(self.store, "get_evaluator_checkpoints", job_id)
+            return checkpoints.get(key)
+
+        async def save_checkpoint(result):
+            await call_storage(
+                self.store, "checkpoint_evaluator", job_id, key,
+                result=self._redact_serialized(_serialize_result(result)),
+            )
+
+        return EvaluationContext(
+            key,
+            load_checkpoint=load_checkpoint,
+            save_checkpoint=save_checkpoint,
+            slot_factory=lambda child: self._evaluation_context(job_id, f"{slot_path}/{child}"),
+        )
 
     @staticmethod
     def _event(raw):

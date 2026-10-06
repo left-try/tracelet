@@ -35,8 +35,14 @@ class SQLAlchemyStore:
             sa.Column("created_at", sa.Float, nullable=False),
             sa.Column("updated_at", sa.Float, nullable=False),
         )
+        self.evaluator_checkpoint_table = sa.Table(
+            f"{table_name}_evaluator_checkpoints", metadata,
+            sa.Column("job_id", sa.String(512), primary_key=True),
+            sa.Column("evaluator_key", sa.String(512), primary_key=True),
+            sa.Column("result", sa.JSON, nullable=False),
+        )
         if create_table:
-            metadata.create_all(engine, tables=[self.table])
+            metadata.create_all(engine, tables=[self.table, self.evaluator_checkpoint_table])
 
     def _row(self, row):
         if row is None:
@@ -92,12 +98,42 @@ class SQLAlchemyStore:
     def checkpoint(self, job_id: str, *, result: Any) -> None:
         self._update(job_id, {"result_checkpoint": result}, where_status="claimed")
 
+    def get_evaluator_checkpoints(self, job_id: str) -> dict[str, Any]:
+        table = self.evaluator_checkpoint_table
+        with self.engine.connect() as conn:
+            rows = conn.execute(
+                self.sa.select(table.c.evaluator_key, table.c.result).where(table.c.job_id == job_id)
+            ).mappings().all()
+        return {row["evaluator_key"]: row["result"] for row in rows}
+
+    def checkpoint_evaluator(self, job_id: str, evaluator_key: str, *, result: Any) -> None:
+        import time
+        sa, jobs, checkpoints = self.sa, self.table, self.evaluator_checkpoint_table
+        with self.engine.begin() as conn:
+            claimed = conn.execute(
+                jobs.update().where((jobs.c.job_id == job_id) & (jobs.c.status == "claimed"))
+                .values(updated_at=time.time())
+            )
+            if claimed.rowcount != 1:
+                raise KeyError(job_id)
+            changed = conn.execute(
+                checkpoints.update().where(
+                    (checkpoints.c.job_id == job_id) & (checkpoints.c.evaluator_key == evaluator_key)
+                ).values(result=result)
+            )
+            if changed.rowcount == 0:
+                conn.execute(checkpoints.insert().values(
+                    job_id=job_id, evaluator_key=evaluator_key, result=result
+                ))
+
     def release(self, job_id: str) -> None:
         self._update(job_id, {"status": "pending", "worker_id": None}, where_status="claimed")
 
     def complete(self, job_id: str, *, result: Any = None) -> None:
-        self._update(job_id, {"status": "completed", "result": result,
-                              "result_checkpoint": None, "worker_id": None})
+        self._terminal_update(job_id, {
+            "status": "completed", "result": result,
+            "result_checkpoint": None, "worker_id": None,
+        })
 
     def retry(self, job_id: str, *, error: str) -> None:
         self._increment(job_id, "pending", error)
@@ -110,7 +146,19 @@ class SQLAlchemyStore:
         values = {"status": "failed", "error": error, "worker_id": None}
         if increment_attempt:
             values["attempts"] = self.table.c.attempts + 1
-        self._update(job_id, values)
+        self._terminal_update(job_id, values)
+
+    def _terminal_update(self, job_id, values):
+        import time
+        table = self.table
+        values["updated_at"] = time.time()
+        with self.engine.begin() as conn:
+            changed = conn.execute(table.update().where(table.c.job_id == job_id).values(**values))
+            if changed.rowcount != 1:
+                raise KeyError(job_id)
+            conn.execute(self.evaluator_checkpoint_table.delete().where(
+                self.evaluator_checkpoint_table.c.job_id == job_id
+            ))
 
     def _increment(self, job_id, status, error):
         import time

@@ -7,6 +7,186 @@ from tests._support import public_symbol
 
 
 class WorkerTests(unittest.TestCase):
+    def test_context_aware_evaluator_result_is_reused_after_parent_checkpoint_failure(self):
+        Event = public_symbol("Event")
+        EvaluationWorker = public_symbol("EvaluationWorker")
+        FileStore = public_symbol("FileStore")
+
+        class FailTopCheckpointOnce:
+            def __init__(self, store):
+                self.store = store
+                self.failed = False
+
+            def __getattr__(self, name):
+                return getattr(self.store, name)
+
+            def checkpoint(self, job_id, *, result):
+                if not self.failed:
+                    self.failed = True
+                    raise RuntimeError("top-level checkpoint interrupted")
+                return self.store.checkpoint(job_id, result=result)
+
+        class ContextAware:
+            name = "external-check"
+            version = "1"
+
+            def __init__(self):
+                self.calls = 0
+
+            async def evaluate_with_context(self, event, *, context):
+                self.calls += 1
+                return {"score_type": "boolean", "score": True}
+
+        async def scenario(directory):
+            base = FileStore(Path(directory))
+            store = FailTopCheckpointOnce(base)
+            evaluator = ContextAware()
+            worker = EvaluationWorker(
+                store=store, evaluator=evaluator, max_attempts=3, poll_interval=0.002,
+            )
+            await worker.enqueue(Event(request_id="context-aware-retry", input="q", output="a"))
+            await worker.start()
+            await worker.wait_idle(timeout=2)
+            await worker.stop()
+            return evaluator.calls, base.get("context-aware-retry")
+
+        with tempfile.TemporaryDirectory() as directory:
+            calls, job = asyncio.run(scenario(directory))
+
+        self.assertEqual(calls, 1)
+        self.assertEqual(job["status"], "completed")
+
+    def test_worker_redacts_event_results_errors_and_archive_records(self):
+        Event = public_symbol("Event")
+        EvaluationWorker = public_symbol("EvaluationWorker")
+        FileStore = public_symbol("FileStore")
+
+        async def scenario(directory):
+            root = Path(directory)
+            store = FileStore(root / "evaluation")
+            archive = FileStore(root / "archive")
+
+            async def evaluator(event):
+                if event.request_id == "redact-error":
+                    raise RuntimeError("provider failed: access_token=access-token-supersecret")
+                return {
+                    "score_type": "text",
+                    "score": "password=result-secret-value",
+                }
+
+            worker = EvaluationWorker(
+                store=store, evaluator=evaluator, archive_store=archive,
+                max_attempts=1, poll_interval=0.002,
+            )
+            await worker.enqueue(Event(
+                request_id="redact-success",
+                input="api_key=input-secret-value",
+                output="ok",
+            ))
+            await worker.enqueue(Event(request_id="redact-error", input="q", output="a"))
+            await worker.start()
+            await worker.wait_idle(timeout=2)
+            await worker.stop()
+            return store.get("redact-success"), store.get("redact-error"), archive.get(
+                "tracelet-eval:redact-success"
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            completed, failed, archived = asyncio.run(scenario(directory))
+
+        self.assertEqual(completed["status"], "completed")
+        self.assertNotIn("input-secret-value", str(completed))
+        self.assertNotIn("result-secret-value", str(completed))
+        self.assertEqual(failed["status"], "failed")
+        self.assertNotIn("access-token-supersecret", str(failed))
+        self.assertNotIn("input-secret-value", str(archived))
+        self.assertNotIn("result-secret-value", str(archived))
+
+    def test_redaction_failure_fails_closed_before_enqueue(self):
+        Event = public_symbol("Event")
+        EvaluationWorker = public_symbol("EvaluationWorker")
+        FileStore = public_symbol("FileStore")
+        RedactionPolicy = public_symbol("RedactionPolicy")
+
+        async def scenario(directory):
+            store = FileStore(Path(directory))
+            worker = EvaluationWorker(
+                store=store,
+                evaluator=lambda _event: {"score_type": "boolean", "score": True},
+                redaction=RedactionPolicy(custom_patterns=("(",)),
+            )
+            with self.assertRaisesRegex(RuntimeError, "secret redaction failed"):
+                await worker.enqueue(Event(
+                    request_id="redaction-fails-closed",
+                    input="api_key=never-persist-this-secret",
+                    output="a",
+                ))
+            return store.get("redaction-fails-closed")
+
+        with tempfile.TemporaryDirectory() as directory:
+            self.assertIsNone(asyncio.run(scenario(directory)))
+
+    def test_restored_result_checkpoint_is_redacted_before_completion(self):
+        EvaluationWorker = public_symbol("EvaluationWorker")
+        FileStore = public_symbol("FileStore")
+        async def scenario(directory):
+            store = FileStore(Path(directory))
+            store.enqueue(job_id="old-checkpoint", payload={"request_id": "old-checkpoint", "input": "q", "output": "a"})
+            store.claim("old-checkpoint", worker_id="test")
+            store.checkpoint("old-checkpoint", result={"details": {"email": "private@example.com"}, "token": "api_key=restore-secret-value"})
+            RedactionPolicy = public_symbol("RedactionPolicy")
+            worker = EvaluationWorker(store=store, evaluator=lambda _event: {},
+                redaction=RedactionPolicy(redact_fields={"details.email"}))
+            await worker._process("old-checkpoint")
+            return store.get("old-checkpoint")
+        with tempfile.TemporaryDirectory() as directory:
+            record = asyncio.run(scenario(directory))
+        self.assertNotIn("restore-secret-value", str(record["result"]))
+        self.assertNotIn("private@example.com", str(record["result"]))
+
+    def test_explicit_redaction_paths_apply_to_dict_input_and_results(self):
+        EvaluationWorker = public_symbol("EvaluationWorker")
+        FileStore = public_symbol("FileStore")
+        RedactionPolicy = public_symbol("RedactionPolicy")
+        async def scenario(directory):
+            store = FileStore(Path(directory))
+            seen = []
+            async def evaluator(event):
+                seen.append(event.input["email"])
+                return {"details": {"email": "output@example.com"}}
+            worker = EvaluationWorker(store=store, evaluator=evaluator,
+                redaction=RedactionPolicy(detect_secrets=False, redact_fields={"input.email", "details.email"}))
+            await worker.enqueue({"request_id": "path-redaction", "input": {"email": "input@example.com"}, "output": "ok"})
+            store.claim("path-redaction", worker_id=worker.worker_id)
+            await worker._process("path-redaction")
+            return seen, store.get("path-redaction")
+        with tempfile.TemporaryDirectory() as directory:
+            seen, record = asyncio.run(scenario(directory))
+        self.assertEqual(seen[0], "[REDACTED]")
+        self.assertNotIn("output@example.com", str(record["result"]))
+
+    def test_explicit_redaction_paths_apply_inside_list_results(self):
+        EvaluationWorker = public_symbol("EvaluationWorker")
+        RedactionPolicy = public_symbol("RedactionPolicy")
+        worker = EvaluationWorker(store=object(), evaluator=lambda _event: None,
+            redaction=RedactionPolicy(detect_secrets=False, redact_fields={"details.email"}))
+        cleaned = worker._redact_serialized([{"details": {"email": "private@example.com"}}])
+        self.assertEqual(cleaned[0]["details"]["email"], "[REDACTED]")
+
+    def test_bound_evaluator_owner_version_changes_root_idempotency_key(self):
+        EvaluationWorker = public_symbol("EvaluationWorker")
+        class Evaluator:
+            name = "bound-check"
+            def __init__(self, version):
+                self.version = version
+            async def evaluate(self, _event):
+                return {"score": True}
+        first = EvaluationWorker(store=object(), evaluator=Evaluator("1").evaluate)
+        second = EvaluationWorker(store=object(), evaluator=Evaluator("2").evaluate)
+        first_context = first._evaluation_context("same-job", "root:" + ":".join(first._evaluator_identity(first.evaluator)))
+        second_context = second._evaluation_context("same-job", "root:" + ":".join(second._evaluator_identity(second.evaluator)))
+        self.assertNotEqual(first_context.idempotency_key, second_context.idempotency_key)
+
     def test_worker_processes_enqueued_job_without_blocking_enqueue(self):
         FileStore = public_symbol("FileStore")
         EvaluationWorker = public_symbol("EvaluationWorker")

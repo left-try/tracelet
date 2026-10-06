@@ -40,6 +40,31 @@ class SQLiteD1Transport:
 
 
 class CloudflareD1StoreTests(unittest.TestCase):
+    def test_per_evaluator_checkpoints_survive_recovery_and_clear_on_completion(self):
+        CloudflareD1Store = public_symbol("CloudflareD1Store")
+        client = SQLiteD1Transport()
+        store = CloudflareD1Store(client=client, query_url="https://d1.example/query")
+
+        async def scenario():
+            await store.initialize()
+            await store.enqueue("slot-d1", {"request_id": "slot-d1"})
+            self.assertEqual(await store.get_evaluator_checkpoints("slot-d1"), {})
+            with self.assertRaises(KeyError):
+                await store.checkpoint_evaluator("slot-d1", "eval-0", result={"score": 1})
+
+            await store.claim("slot-d1", worker_id="worker")
+            await store.checkpoint_evaluator("slot-d1", "eval-0", result={"score": 1})
+            await store.release("slot-d1")
+            restarted = CloudflareD1Store(client=client, query_url="https://d1.example/query")
+            await restarted.initialize()
+            self.assertEqual(await restarted.get_evaluator_checkpoints("slot-d1"), {"eval-0": {"score": 1}})
+
+            await restarted.claim("slot-d1", worker_id="worker-2")
+            await restarted.complete("slot-d1", result=[])
+            self.assertEqual(await restarted.get_evaluator_checkpoints("slot-d1"), {})
+
+        asyncio.run(scenario())
+
     def test_store_persists_and_transitions_jobs_using_async_d1_queries(self):
         CloudflareD1Store = public_symbol("CloudflareD1Store")
         client = SQLiteD1Transport()
@@ -218,6 +243,18 @@ class CloudflareD1StoreTests(unittest.TestCase):
             self.assertEqual([row["job_id"] for row in await store.list_pending()], ["first"])
 
         asyncio.run(scenario())
+
+    def test_complete_default_none_round_trips_as_json_null(self):
+        CloudflareD1Store = public_symbol("CloudflareD1Store")
+        store = CloudflareD1Store(client=SQLiteD1Transport(), query_url="https://d1.example/query")
+        async def scenario():
+            await store.initialize()
+            await store.enqueue("null-result", {"input": "q"})
+            await store.claim("null-result", worker_id="test")
+            await store.complete("null-result")
+            return await store.get("null-result")
+        record = asyncio.run(scenario())
+        self.assertIsNone(record["result"])
 
     def test_sync_http_client_does_not_block_the_event_loop(self):
         CloudflareD1Store = public_symbol("CloudflareD1Store")

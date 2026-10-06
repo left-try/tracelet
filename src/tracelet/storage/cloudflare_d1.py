@@ -50,6 +50,8 @@ class CloudflareD1Store:
         self.query_url = query_url
         self.table_name = table_name
         self._quoted_table = f'"{table_name}"'
+        self.checkpoint_table_name = f"{table_name}_evaluator_checkpoints"
+        self._quoted_checkpoint_table = f'"{self.checkpoint_table_name}"'
         self.api_token = api_token
         self.api_style = api_style
         self.pending_limit = pending_limit
@@ -73,6 +75,11 @@ class CloudflareD1Store:
         await self._query(
             f"CREATE INDEX IF NOT EXISTS \"{self.table_name}_pending_created\" "
             f"ON {self._quoted_table} (status, created_at, job_id)"
+        )
+        await self._query(
+            f"CREATE TABLE IF NOT EXISTS {self._quoted_checkpoint_table} ("
+            "job_id TEXT NOT NULL, evaluator_key TEXT NOT NULL, result TEXT NOT NULL, "
+            "PRIMARY KEY (job_id, evaluator_key))"
         )
         await self._query(
             f"UPDATE {self._quoted_table} SET status = 'pending', worker_id = NULL, updated_at = ? "
@@ -181,6 +188,26 @@ class CloudflareD1Store:
         if not rows:
             raise KeyError(job_id)
 
+    async def get_evaluator_checkpoints(self, job_id: str) -> dict[str, Any]:
+        rows = await self._query(
+            f"SELECT evaluator_key, result FROM {self._quoted_checkpoint_table} "
+            "WHERE job_id = ? ORDER BY evaluator_key",
+            [job_id],
+        )
+        return {row["evaluator_key"]: json.loads(row["result"]) for row in rows}
+
+    async def checkpoint_evaluator(self, job_id: str, evaluator_key: str, *, result: Any) -> None:
+        rows = await self._query(
+            f"INSERT INTO {self._quoted_checkpoint_table} (job_id, evaluator_key, result) "
+            f"SELECT ?, ?, ? WHERE EXISTS (SELECT 1 FROM {self._quoted_table} "
+            "WHERE job_id = ? AND status = 'claimed') "
+            "ON CONFLICT(job_id, evaluator_key) DO UPDATE SET result = excluded.result "
+            "RETURNING evaluator_key",
+            [job_id, evaluator_key, json.dumps(result, ensure_ascii=False, allow_nan=False), job_id],
+        )
+        if not rows:
+            raise KeyError(job_id)
+
     async def release(self, job_id: str) -> None:
         await self._query(
             f"UPDATE {self._quoted_table} SET status = 'pending', worker_id = NULL, updated_at = ? "
@@ -198,6 +225,7 @@ class CloudflareD1Store:
         )
         if not rows:
             raise KeyError(job_id)
+        await self._delete_evaluator_checkpoints(job_id)
 
     async def retry(self, job_id: str, *, error: str) -> None:
         rows = await self._query(
@@ -228,6 +256,13 @@ class CloudflareD1Store:
         )
         if not rows:
             raise KeyError(job_id)
+        await self._delete_evaluator_checkpoints(job_id)
+
+    async def _delete_evaluator_checkpoints(self, job_id: str) -> None:
+        await self._query(
+            f"DELETE FROM {self._quoted_checkpoint_table} WHERE job_id = ?",
+            [job_id],
+        )
 
     async def close(self) -> None:
         """Close the internally created HTTP client, leaving supplied clients alone."""
