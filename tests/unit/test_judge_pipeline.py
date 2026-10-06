@@ -66,6 +66,45 @@ class JudgePipelineTests(unittest.TestCase):
         self.assertNotEqual(first.keys[0], second.keys[0])
         self.assertEqual(second.keys[0], second.keys[1])
 
+    def test_context_aware_cheap_and_final_judges_receive_distinct_keys(self):
+        Event = public_symbol("Event")
+        EvaluationPipeline = public_symbol("EvaluationPipeline")
+        from tracelet import EvaluationContext
+        keys = []
+        class Judge:
+            name = "context-judge"
+            version = "2"
+            async def evaluate_with_context(self, _event, *, context):
+                keys.append(context.idempotency_key)
+                return {"score_type": "categorical", "score": "uncertain"}
+        async def scenario():
+            pipeline = EvaluationPipeline(cheap_judge=Judge(), judge=Judge(), escalate_on={"uncertain"})
+            async def load():
+                return None
+            async def save(_value):
+                return None
+            root = EvaluationContext("stable-job", slot_factory=lambda part: EvaluationContext(
+                part, load_checkpoint=load, save_checkpoint=save))
+            return await pipeline.evaluate_with_context(Event(request_id="judges", input="q", output="a"), context=root)
+        results = asyncio.run(scenario())
+        self.assertEqual(len(results), 2)
+        self.assertEqual(len(keys), 2)
+        self.assertNotEqual(keys[0], keys[1])
+
+    def test_sampling_decision_is_stable_for_same_request(self):
+        Event = public_symbol("Event")
+        EvaluationPipeline = public_symbol("EvaluationPipeline")
+        calls = []
+        async def judge(_event):
+            calls.append(True)
+            return {"score_type": "boolean", "score": True}
+        pipeline = EvaluationPipeline(judge=judge, sample_rate=0.5)
+        event = Event(request_id="retry-stable-sample", input="q", output="a")
+        first = asyncio.run(pipeline.run(event))
+        second = asyncio.run(pipeline.run(event))
+        self.assertEqual([item.status for item in first], [item.status for item in second])
+        self.assertEqual(len(calls), 2 if first[0].status == "completed" else 0)
+
     def test_observed_cost_ceiling_skips_later_judge_calls(self):
         Event = public_symbol("Event")
         EvaluationPipeline = public_symbol("EvaluationPipeline")

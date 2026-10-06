@@ -77,12 +77,20 @@ class RedactionPolicy:
         if not isinstance(record, dict):
             raise TypeError("redaction requires an object record")
         record = deepcopy(record)
-        for dotted_path in self.redact_fields:
-            parent, key = _path_parent(record, dotted_path)
-            if parent is not None and key in parent:
-                parent[key] = self.replacement
-        for dotted_path in self.exclude_fields:
-            parent, key = _path_parent(record, dotted_path)
-            if parent is not None:
-                parent.pop(key, None)
+        def apply_paths(node):
+            if isinstance(node, dict):
+                for dotted_path in self.redact_fields:
+                    parent, key = _path_parent(node, dotted_path)
+                    if parent is not None and key in parent:
+                        parent[key] = self.replacement
+                for dotted_path in self.exclude_fields:
+                    parent, key = _path_parent(node, dotted_path)
+                    if parent is not None:
+                        parent.pop(key, None)
+                for child in node.values():
+                    apply_paths(child)
+            elif isinstance(node, list):
+                for child in node:
+                    apply_paths(child)
+        apply_paths(record)
         return self.sanitize(record)

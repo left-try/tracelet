@@ -126,6 +126,67 @@ class WorkerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             self.assertIsNone(asyncio.run(scenario(directory)))
 
+    def test_restored_result_checkpoint_is_redacted_before_completion(self):
+        EvaluationWorker = public_symbol("EvaluationWorker")
+        FileStore = public_symbol("FileStore")
+        async def scenario(directory):
+            store = FileStore(Path(directory))
+            store.enqueue(job_id="old-checkpoint", payload={"request_id": "old-checkpoint", "input": "q", "output": "a"})
+            store.claim("old-checkpoint", worker_id="test")
+            store.checkpoint("old-checkpoint", result={"details": {"email": "private@example.com"}, "token": "api_key=restore-secret-value"})
+            RedactionPolicy = public_symbol("RedactionPolicy")
+            worker = EvaluationWorker(store=store, evaluator=lambda _event: {},
+                redaction=RedactionPolicy(redact_fields={"details.email"}))
+            await worker._process("old-checkpoint")
+            return store.get("old-checkpoint")
+        with tempfile.TemporaryDirectory() as directory:
+            record = asyncio.run(scenario(directory))
+        self.assertNotIn("restore-secret-value", str(record["result"]))
+        self.assertNotIn("private@example.com", str(record["result"]))
+
+    def test_explicit_redaction_paths_apply_to_dict_input_and_results(self):
+        EvaluationWorker = public_symbol("EvaluationWorker")
+        FileStore = public_symbol("FileStore")
+        RedactionPolicy = public_symbol("RedactionPolicy")
+        async def scenario(directory):
+            store = FileStore(Path(directory))
+            seen = []
+            async def evaluator(event):
+                seen.append(event.input["email"])
+                return {"details": {"email": "output@example.com"}}
+            worker = EvaluationWorker(store=store, evaluator=evaluator,
+                redaction=RedactionPolicy(detect_secrets=False, redact_fields={"input.email", "details.email"}))
+            await worker.enqueue({"request_id": "path-redaction", "input": {"email": "input@example.com"}, "output": "ok"})
+            store.claim("path-redaction", worker_id=worker.worker_id)
+            await worker._process("path-redaction")
+            return seen, store.get("path-redaction")
+        with tempfile.TemporaryDirectory() as directory:
+            seen, record = asyncio.run(scenario(directory))
+        self.assertEqual(seen[0], "[REDACTED]")
+        self.assertNotIn("output@example.com", str(record["result"]))
+
+    def test_explicit_redaction_paths_apply_inside_list_results(self):
+        EvaluationWorker = public_symbol("EvaluationWorker")
+        RedactionPolicy = public_symbol("RedactionPolicy")
+        worker = EvaluationWorker(store=object(), evaluator=lambda _event: None,
+            redaction=RedactionPolicy(detect_secrets=False, redact_fields={"details.email"}))
+        cleaned = worker._redact_serialized([{"details": {"email": "private@example.com"}}])
+        self.assertEqual(cleaned[0]["details"]["email"], "[REDACTED]")
+
+    def test_bound_evaluator_owner_version_changes_root_idempotency_key(self):
+        EvaluationWorker = public_symbol("EvaluationWorker")
+        class Evaluator:
+            name = "bound-check"
+            def __init__(self, version):
+                self.version = version
+            async def evaluate(self, _event):
+                return {"score": True}
+        first = EvaluationWorker(store=object(), evaluator=Evaluator("1").evaluate)
+        second = EvaluationWorker(store=object(), evaluator=Evaluator("2").evaluate)
+        first_context = first._evaluation_context("same-job", "root:" + ":".join(first._evaluator_identity(first.evaluator)))
+        second_context = second._evaluation_context("same-job", "root:" + ":".join(second._evaluator_identity(second.evaluator)))
+        self.assertNotEqual(first_context.idempotency_key, second_context.idempotency_key)
+
     def test_worker_processes_enqueued_job_without_blocking_enqueue(self):
         FileStore = public_symbol("FileStore")
         EvaluationWorker = public_symbol("EvaluationWorker")

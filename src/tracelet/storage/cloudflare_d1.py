@@ -220,7 +220,7 @@ class CloudflareD1Store:
             f"UPDATE {self._quoted_table} SET status = 'completed', result = ?, "
             "result_checkpoint = NULL, worker_id = NULL, updated_at = ? "
             "WHERE job_id = ? RETURNING job_id",
-            [json.dumps(result, ensure_ascii=False, allow_nan=False) if result is not None else None,
+            [json.dumps(result, ensure_ascii=False, allow_nan=False),
              str(time.time()), job_id],
         )
         if not rows:

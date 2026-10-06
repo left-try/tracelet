@@ -244,6 +244,18 @@ class CloudflareD1StoreTests(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    def test_complete_default_none_round_trips_as_json_null(self):
+        CloudflareD1Store = public_symbol("CloudflareD1Store")
+        store = CloudflareD1Store(client=SQLiteD1Transport(), query_url="https://d1.example/query")
+        async def scenario():
+            await store.initialize()
+            await store.enqueue("null-result", {"input": "q"})
+            await store.claim("null-result", worker_id="test")
+            await store.complete("null-result")
+            return await store.get("null-result")
+        record = asyncio.run(scenario())
+        self.assertIsNone(record["result"])
+
     def test_sync_http_client_does_not_block_the_event_loop(self):
         CloudflareD1Store = public_symbol("CloudflareD1Store")
 

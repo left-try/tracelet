@@ -101,7 +101,7 @@ class EvaluationWorker:
             payload = {"event": event.to_dict(redaction=self.redaction)}
             job_id = job_id or event.request_id
         else:
-            payload = self.redaction.sanitize(event)
+            payload = self.redaction.apply(event)
             job_id = job_id or event.get("request_id") or str(uuid.uuid4())
         await call_storage(self.store, "enqueue", job_id=job_id, payload=payload)
         self._wake.set()
@@ -139,10 +139,10 @@ class EvaluationWorker:
                 job = await call_storage(self.store, "get", job_id)
                 payload = job["payload"]
                 raw_event = payload.get("event", payload) if isinstance(payload, dict) else payload
-                raw_event = self.redaction.sanitize(raw_event)
+                raw_event = self.redaction.apply(raw_event) if isinstance(raw_event, dict) else self.redaction.sanitize(raw_event)
                 event = self._event(raw_event)
                 if "result_checkpoint" in job:
-                    serialized_result = job["result_checkpoint"]
+                    serialized_result = self._redact_serialized(job["result_checkpoint"])
                 else:
                     contextual_target = self._contextual_target(self.evaluator)
                     context = None
@@ -163,7 +163,8 @@ class EvaluationWorker:
                         )
                     elif contextual_target is not None:
                         self._require_evaluator_checkpoint_store()
-                        context = self._evaluation_context(job_id, "root")
+                        root_name, root_version = self._evaluator_identity(self.evaluator)
+                        context = self._evaluation_context(job_id, f"root:{root_name}:{root_version}")
                         cached_context_result = await context.load_checkpoint()
                         call = None if cached_context_result is not None else contextual_target(event, context=context)
                     else:
@@ -194,10 +195,10 @@ class EvaluationWorker:
                             "comparison": comparison,
                             "pairwise": pairwise,
                         }
-                    serialized_result = self.redaction.sanitize(_serialize_result(result))
+                    serialized_result = self._redact_serialized(_serialize_result(result))
                     await call_storage(self.store, "checkpoint", job_id, result=serialized_result)
                 if self.archive_store is not None:
-                    archive_payload = self.redaction.sanitize({
+                    archive_payload = self.redaction.apply({
                         "schema_version": 1,
                         "source_job_id": job_id,
                         "request_id": getattr(event, "request_id", job_id),
@@ -237,6 +238,23 @@ class EvaluationWorker:
         method = getattr(owner, "evaluate_with_context", None)
         return method if callable(method) else None
 
+    def _redact_serialized(self, value):
+        if isinstance(value, dict):
+            return self.redaction.apply(value)
+        if isinstance(value, list):
+            return [self._redact_serialized(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(self._redact_serialized(item) for item in value)
+        return self.redaction.sanitize(value)
+
+    @staticmethod
+    def _evaluator_identity(evaluator):
+        owner = getattr(evaluator, "__self__", None)
+        target = owner if owner is not None else evaluator
+        name = getattr(target, "name", getattr(evaluator, "__name__", type(target).__name__))
+        version = str(getattr(target, "version", "1"))
+        return name, version
+
     def _require_evaluator_checkpoint_store(self):
         missing = [
             name for name in ("get_evaluator_checkpoints", "checkpoint_evaluator")
@@ -260,7 +278,7 @@ class EvaluationWorker:
         async def save_checkpoint(result):
             await call_storage(
                 self.store, "checkpoint_evaluator", job_id, key,
-                result=self.redaction.sanitize(_serialize_result(result)),
+                result=self._redact_serialized(_serialize_result(result)),
             )
 
         return EvaluationContext(

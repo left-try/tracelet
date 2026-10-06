@@ -4,6 +4,7 @@ import inspect
 import time
 import asyncio
 import math
+import hashlib
 
 from .evaluator import _call_evaluator, _restore_result
 from .result import EvaluationResult
@@ -161,7 +162,8 @@ class EvaluationPipeline:
                     return result
                 self._judge_calls += 1
                 try:
-                    result = await self._evaluate(evaluator, event)
+                    result = await (_call_evaluator(evaluator, event, context=slot)
+                                   if slot is not None else self._evaluate(evaluator, event))
                 except Exception as exc:
                     result = EvaluationResult.error_result(name, version, exc)
                 if slot is not None:
@@ -178,9 +180,10 @@ class EvaluationPipeline:
         return await self._run(event, context=context)
 
     async def _run(self, event, *, context):
-        import random
-
-        if self.sample_rate < 1 and random.random() >= self.sample_rate:
+        sample_identity = (context.idempotency_key if context is not None else
+                           str(getattr(event, "request_id", repr(event))))
+        sample_value = int(hashlib.sha256(sample_identity.encode("utf-8")).hexdigest()[:16], 16) / 2**64
+        if self.sample_rate < 1 and sample_value >= self.sample_rate:
             return [EvaluationResult.skipped_result("evaluation-pipeline", "1", "excluded by sampling")]
         results = []
         for index, evaluator in enumerate(self.deterministic):

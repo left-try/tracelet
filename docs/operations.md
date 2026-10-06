@@ -40,4 +40,4 @@ Use a separate archive outbox for S3 draining. Pointing the evaluation worker an
 
 ## Capacity and cost controls
 
-Use `EvaluationPipeline(sample_rate=...)` to sample events, deterministic checks before judges, `cheap_judge` for low-cost triage, and `max_judge_calls` to bound calls. Set provider-side timeouts and budgets in the callable you provide as well. Tracelet does not estimate or enforce monetary spend from provider-specific pricing.
+Use `EvaluationPipeline(sample_rate=...)` to sample events, deterministic checks before judges, `cheap_judge` for low-cost triage, and `max_judge_calls` to bound calls. Sampling is deterministic for a request ID (or the stable worker context key), so retrying a job does not change its sampling decision. Set provider-side timeouts and budgets in the callable you provide as well. Tracelet does not estimate or enforce monetary spend from provider-specific pricing.

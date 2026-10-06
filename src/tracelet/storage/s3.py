@@ -23,7 +23,7 @@ class S3Sink:
         return f"{self.prefix}/{name}" if self.prefix else name
 
     async def write(self, *, job_id: str, record: dict) -> None:
-        sanitized = self.redaction.sanitize(record)
+        sanitized = self.redaction.apply(record) if isinstance(record, dict) else self.redaction.sanitize(record)
         body = json.dumps(sanitized, ensure_ascii=False, allow_nan=False).encode("utf-8")
         call = self.client.put_object
         kwargs = {"Bucket": self.bucket, "Key": self.object_key(job_id),
