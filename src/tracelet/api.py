@@ -19,7 +19,7 @@ class Tracelet:
                 raw = raw[7:]
             storage = FileStore(raw)
         self.storage = storage
-        self.redaction = redaction
+        self.redaction = redaction or RedactionPolicy()
 
     def record_nowait(self, event: Event, *, job_id: str | None = None) -> str:
         if not isinstance(event, Event):
