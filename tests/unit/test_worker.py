@@ -7,6 +7,76 @@ from tests._support import public_symbol
 
 
 class WorkerTests(unittest.TestCase):
+    def test_worker_redacts_event_results_errors_and_archive_records(self):
+        Event = public_symbol("Event")
+        EvaluationWorker = public_symbol("EvaluationWorker")
+        FileStore = public_symbol("FileStore")
+
+        async def scenario(directory):
+            root = Path(directory)
+            store = FileStore(root / "evaluation")
+            archive = FileStore(root / "archive")
+
+            async def evaluator(event):
+                if event.request_id == "redact-error":
+                    raise RuntimeError("provider failed: access_token=access-token-supersecret")
+                return {
+                    "score_type": "text",
+                    "score": "password=result-secret-value",
+                }
+
+            worker = EvaluationWorker(
+                store=store, evaluator=evaluator, archive_store=archive,
+                max_attempts=1, poll_interval=0.002,
+            )
+            await worker.enqueue(Event(
+                request_id="redact-success",
+                input="api_key=input-secret-value",
+                output="ok",
+            ))
+            await worker.enqueue(Event(request_id="redact-error", input="q", output="a"))
+            await worker.start()
+            await worker.wait_idle(timeout=2)
+            await worker.stop()
+            return store.get("redact-success"), store.get("redact-error"), archive.get(
+                "tracelet-eval:redact-success"
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            completed, failed, archived = asyncio.run(scenario(directory))
+
+        self.assertEqual(completed["status"], "completed")
+        self.assertNotIn("input-secret-value", str(completed))
+        self.assertNotIn("result-secret-value", str(completed))
+        self.assertEqual(failed["status"], "failed")
+        self.assertNotIn("access-token-supersecret", str(failed))
+        self.assertNotIn("input-secret-value", str(archived))
+        self.assertNotIn("result-secret-value", str(archived))
+
+    def test_redaction_failure_fails_closed_before_enqueue(self):
+        Event = public_symbol("Event")
+        EvaluationWorker = public_symbol("EvaluationWorker")
+        FileStore = public_symbol("FileStore")
+        RedactionPolicy = public_symbol("RedactionPolicy")
+
+        async def scenario(directory):
+            store = FileStore(Path(directory))
+            worker = EvaluationWorker(
+                store=store,
+                evaluator=lambda _event: {"score_type": "boolean", "score": True},
+                redaction=RedactionPolicy(custom_patterns=("(",)),
+            )
+            with self.assertRaisesRegex(RuntimeError, "secret redaction failed"):
+                await worker.enqueue(Event(
+                    request_id="redaction-fails-closed",
+                    input="api_key=never-persist-this-secret",
+                    output="a",
+                ))
+            return store.get("redaction-fails-closed")
+
+        with tempfile.TemporaryDirectory() as directory:
+            self.assertIsNone(asyncio.run(scenario(directory)))
+
     def test_worker_processes_enqueued_job_without_blocking_enqueue(self):
         FileStore = public_symbol("FileStore")
         EvaluationWorker = public_symbol("EvaluationWorker")

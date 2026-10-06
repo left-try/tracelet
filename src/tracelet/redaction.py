@@ -62,7 +62,10 @@ class RedactionPolicy:
 
     def sanitize(self, value: Any) -> Any:
         """Return a sanitized copy of a JSON-compatible value."""
-        return self._sanitize(value, self._patterns())
+        try:
+            return self._sanitize(value, self._patterns())
+        except Exception:
+            raise RuntimeError("secret redaction failed; value was not persisted") from None
 
     def apply(self, value: Any) -> dict[str, Any]:
         if is_dataclass(value):

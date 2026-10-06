@@ -14,6 +14,7 @@ from .errors import WorkerClosedError
 from .context import EvaluationContext
 from .event import Event
 from .evaluator import evaluate, evaluate_with_context
+from .redaction import RedactionPolicy
 from .storage.protocol import call_storage
 
 
@@ -53,6 +54,7 @@ class EvaluationWorker:
         max_attempts: int = 3,
         poll_interval: float = 0.05,
         timeout: float | None = None,
+        redaction: RedactionPolicy | None = None,
     ):
         if evaluator is None and not evaluators:
             raise ValueError("provide evaluator or a non-empty evaluator registry")
@@ -75,6 +77,7 @@ class EvaluationWorker:
         self.max_attempts = max_attempts
         self.poll_interval = max(0.001, poll_interval)
         self.timeout = timeout
+        self.redaction = redaction or RedactionPolicy()
         self.worker_id = str(uuid.uuid4())
         self._runner: asyncio.Task | None = None
         self._tasks: set[asyncio.Task] = set()
@@ -95,10 +98,10 @@ class EvaluationWorker:
         if self._stopping:
             raise WorkerClosedError("worker has stopped")
         if isinstance(event, Event):
-            payload = {"event": event.to_dict()}
+            payload = {"event": event.to_dict(redaction=self.redaction)}
             job_id = job_id or event.request_id
         else:
-            payload = event
+            payload = self.redaction.sanitize(event)
             job_id = job_id or event.get("request_id") or str(uuid.uuid4())
         await call_storage(self.store, "enqueue", job_id=job_id, payload=payload)
         self._wake.set()
@@ -136,6 +139,7 @@ class EvaluationWorker:
                 job = await call_storage(self.store, "get", job_id)
                 payload = job["payload"]
                 raw_event = payload.get("event", payload) if isinstance(payload, dict) else payload
+                raw_event = self.redaction.sanitize(raw_event)
                 event = self._event(raw_event)
                 if "result_checkpoint" in job:
                     serialized_result = job["result_checkpoint"]
@@ -183,33 +187,38 @@ class EvaluationWorker:
                             "comparison": comparison,
                             "pairwise": pairwise,
                         }
-                    serialized_result = _serialize_result(result)
+                    serialized_result = self.redaction.sanitize(_serialize_result(result))
                     await call_storage(self.store, "checkpoint", job_id, result=serialized_result)
                 if self.archive_store is not None:
+                    archive_payload = self.redaction.sanitize({
+                        "schema_version": 1,
+                        "source_job_id": job_id,
+                        "request_id": getattr(event, "request_id", job_id),
+                        "event": _serialize_result(raw_event),
+                        "result": serialized_result,
+                    })
                     await call_storage(
                         self.archive_store,
                         "enqueue",
                         job_id=f"tracelet-eval:{job_id}",
-                        payload={
-                            "schema_version": 1,
-                            "source_job_id": job_id,
-                            "request_id": getattr(event, "request_id", job_id),
-                            "event": _serialize_result(raw_event),
-                            "result": serialized_result,
-                        },
+                        payload=archive_payload,
                     )
                 await call_storage(self.store, "complete", job_id, result=serialized_result)
             except asyncio.CancelledError:
                 await call_storage(self.store, "release", job_id)
                 raise
             except Exception as exc:
+                try:
+                    error = self.redaction.sanitize(str(exc))
+                except Exception:
+                    error = "evaluation failed; redaction unavailable"
                 job = await call_storage(self.store, "get", job_id) or {}
                 attempts = int(job.get("attempts", 0)) + 1
                 if attempts < self.max_attempts:
-                    await call_storage(self.store, "retry", job_id, error=str(exc))
+                    await call_storage(self.store, "retry", job_id, error=error)
                     await asyncio.sleep(min(0.01 * (2 ** max(0, attempts - 1)), 0.5))
                 else:
-                    await call_storage(self.store, "fail", job_id, error=str(exc), retryable=False)
+                    await call_storage(self.store, "fail", job_id, error=error, retryable=False)
 
     @staticmethod
     def _contextual_target(evaluator):
@@ -243,7 +252,8 @@ class EvaluationWorker:
 
         async def save_checkpoint(result):
             await call_storage(
-                self.store, "checkpoint_evaluator", job_id, key, result=_serialize_result(result)
+                self.store, "checkpoint_evaluator", job_id, key,
+                result=self.redaction.sanitize(_serialize_result(result)),
             )
 
         return EvaluationContext(
