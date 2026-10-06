@@ -50,13 +50,13 @@ Start the worker once during application startup and stop it at shutdown. For Fa
 ## What works today
 
 - Versioned `Event` and `EvaluationResult` data types with JSON serialization and validation.
-- File-backed pending/claimed/completed/failed job states, restart recovery of claimed files, duplicate job-ID suppression, and bounded retries in the worker.
+- File-backed pending/claimed/completed/failed job states, restart recovery of claimed files, per-evaluator result checkpoints, duplicate job-ID suppression, and bounded retries in the worker.
 - Built-in deterministic checks: JSON schema subset, required/forbidden text, regex, length, numeric range, exact match, and citation-reference presence.
 - Custom synchronous and asynchronous evaluators through `EvaluationPipeline`.
 - LLM judge adapter that calls a user-supplied callable, plus cheap-first escalation, sampling, call and observed-cost caps, and a concurrency limit.
 - Evidence/NLI adapter for a user-provided classifier, plus optional `LocalNLIClassifier` backed by Transformers and a model already present locally.
 - Candidate call runner and pairwise judge helper. Configure them on `EvaluationWorker` to run after the production event is queued and persist candidate outputs and pairwise verdicts in the completed job.
-- Configurable dotted-path redaction and field exclusion before event persistence.
+- Default heuristic secret-pattern redaction plus configurable dotted-path replacement/exclusion and custom patterns before event persistence, evaluation, result storage, and S3 upload.
 - S3-compatible JSON sink and polling drain worker that accept a caller-provided client and store; synchronous clients such as boto3 run in a worker thread.
 - Optional SQLAlchemy Core storage adapter (`tracelet-evals[sql]`) for an application-owned Engine, including PostgreSQL when the application installs its DB driver.
 - Optional async Cloudflare D1 storage adapter (`tracelet-evals[d1]`) with restart recovery for a single active worker per table.
@@ -69,7 +69,7 @@ Start the worker once during application startup and stop it at shutdown. For Fa
 2. **D1 operations:** D1 is a remote HTTP store, so each storage action adds network latency. `CloudflareD1Store.initialize()` recovers all claimed rows and therefore assumes one active process per table; it does not provide multi-worker leases. Direct Cloudflare REST access is rate-limited; use a secured Worker proxy for sustained traffic. Terminal-row retention is application-managed.
 3. **SQL operations:** `SQLAlchemyStore` uses short transactions on an application-owned Engine and creates its table by default. It is not an ORM-session adapter, does not join application transactions, and needs real PostgreSQL concurrency/restart validation before production claims.
 4. **Judge cost controls:** limits use reported `usage.cost_usd` (or `usage.cost`). Since a call's cost is unknown until it returns, one call can exceed the ceiling; later calls are skipped. This is observed-cost control, not provider-side hard spend enforcement.
-5. **NLI/model operation:** `LocalNLIClassifier` requires heavyweight optional `transformers`/`torch` dependencies and a model already downloaded or stored locally. Map labels explicitly for models with nonstandard labels. Automatic secret/PII detection and randomized pairwise order are not included.
+5. **NLI/model operation:** `LocalNLIClassifier` requires heavyweight optional `transformers`/`torch` dependencies and a model already downloaded or stored locally. Map labels explicitly for models with nonstandard labels. Secret detection uses heuristics and does not detect arbitrary credentials or PII; randomized pairwise order is not included.
 6. **Inspection/export:** FileStore can prune terminal records by age, but there is no query/export CLI or UI. S3 object overwrite behavior is idempotent by key, not immutable/versioned.
 
 Treat this version as a library building block to integrate and validate in your service, not as a turnkey production evaluation system.
@@ -108,13 +108,30 @@ The default `Tracelet()` location is `./.tracelet`. The file store is intended f
 
 `record()` waits until the outbox write completes, so accepted events are durable before it returns. Synchronous adapter methods run through `asyncio.to_thread`; this keeps filesystem/DB work off the event loop but does not remove request latency. Async adapters are preferred when available. A thread-affine sync adapter can set `sync_on_event_loop = True`, which opts out and may block.
 
-Worker execution is at-least-once around crashes. An evaluator may finish and the process may die before the job is marked complete, so evaluators with external side effects should be idempotent. `max_attempts` controls worker retries; failed jobs remain inspectable in the failed state. Shutdown drains for a bounded period and releases cancelled claims for later processing.
+Worker execution remains at-least-once around crashes. `EvaluationPipeline` checkpoints each evaluator result before moving to the next, so a recovered job reuses completed slots. The worker also checkpoints the completed top-level result before archive delivery. A process can still die after an external side effect but before its checkpoint is durable; an opted-in evaluator can receive a stable key and pass it to its provider or service:
+
+```python
+class ExternalCheck:
+    name = "external-check"
+    version = "1"
+
+    async def evaluate_with_context(self, event, *, context):
+        response = await call_your_service(
+            event.input,
+            idempotency_key=context.idempotency_key,
+        )
+        return {"score_type": "boolean", "score": response.ok}
+
+worker = EvaluationWorker(store=store, evaluator=ExternalCheck())
+```
+
+The key is stable for the same job and evaluator slot across retries and restarts. The external service must honor it to deduplicate side effects. The worker and pipeline use `context.load_checkpoint()` and `context.save_checkpoint(result)` to reuse completed evaluator results. Legacy `evaluate(event)` evaluators remain supported, but may repeat in the gap before their result is saved. Custom storage adapters used with context-aware evaluators must implement `get_evaluator_checkpoints()` and `checkpoint_evaluator()`; built-in stores provide both. `max_attempts` controls worker retries; failed jobs remain inspectable in the failed state. Shutdown drains for a bounded period and releases cancelled claims for later processing.
 
 S3 is a sink, not a transactional outbox. Configure `EvaluationWorker(archive_store=archive_outbox)` to checkpoint and enqueue completed evaluation records to a separate archive outbox, then run `S3DrainWorker(store=archive_outbox, sink=s3_sink)`. The evaluation store needs `checkpoint()` when archive delivery is enabled. Do not point both workers at the same pending queue, because they compete to claim each job. S3 retries use the same deterministic object key and overwrite it. A synchronous client such as boto3 is called in a worker thread. Ensure the archive adapter implements the complete storage contract.
 
-For SQL storage, install `tracelet-evals[sql]`, create an SQLAlchemy Engine with the application's database driver, then pass `SQLAlchemyStore(engine)` as the store. It uses short transactions and does not use an ORM session or join a surrounding request transaction. It creates `tracelet_jobs` unless `create_table=False` is supplied.
+For SQL storage, install `tracelet-evals[sql]`, create an SQLAlchemy Engine with the application's database driver, then pass `SQLAlchemyStore(engine)` as the store. It uses short transactions and does not use an ORM session or join a surrounding request transaction. It creates `tracelet_jobs` and the auxiliary `tracelet_jobs_evaluator_checkpoints` table by default. With `create_table=False`, the application must create both tables.
 
-For Cloudflare D1, install `tracelet-evals[d1]` and use the async `CloudflareD1Store`. Call `await store.initialize()` once during application startup before starting the worker; it creates the outbox table and recovers claims left by a previous process. `pending_limit` bounds rows fetched per poll (default 100). For the Cloudflare REST API, pass its full `/accounts/{account_id}/d1/database/{database_id}/query` URL and a D1 API token. For a Worker proxy using `D1Database.prepare(...).run()`, set `api_style="worker-proxy"` and pass the proxy URL. The adapter uses parameterized SQL, and query parameters are sent as strings per the D1 REST API contract. It supports a single active worker per table: initialization requeues every claimed row, so do not initialize it while another process is working that table. Cloudflare documents its REST API as control-plane-oriented and rate-limited; use a secured Worker proxy for sustained runtime traffic ([D1 external access guidance](https://developers.cloudflare.com/d1/tutorials/build-an-api-to-access-d1/)).
+For Cloudflare D1, install `tracelet-evals[d1]` and use the async `CloudflareD1Store`. Call `await store.initialize()` once during application startup before starting the worker; it creates the outbox and evaluator-checkpoint tables and recovers claims left by a previous process. `pending_limit` bounds rows fetched per poll (default 100). For the Cloudflare REST API, pass its full `/accounts/{account_id}/d1/database/{database_id}/query` URL and a D1 API token. For a Worker proxy using `D1Database.prepare(...).run()`, set `api_style="worker-proxy"` and pass the proxy URL. The adapter uses parameterized SQL, and query parameters are sent as strings per the D1 REST API contract. It supports a single active worker per table: initialization requeues every claimed row, so do not initialize it while another process is working that table. Cloudflare documents its REST API as control-plane-oriented and rate-limited; use a secured Worker proxy for sustained runtime traffic ([D1 external access guidance](https://developers.cloudflare.com/d1/tutorials/build-an-api-to-access-d1/)).
 
 ```python
 store = CloudflareD1Store(
@@ -136,7 +153,7 @@ See [operations and storage](docs/operations.md) and [privacy and security](docs
 
 ## Privacy
 
-Prompts, inputs, context, outputs, judge details, and metadata may contain sensitive data. Capture only what is needed and configure `RedactionPolicy` before persistence. Redaction is explicit path-based replacement/exclusion; it is not PII or credential detection. Judge callables may send captured data outside the process. Apply your own access, encryption, retention, and provider data-handling controls.
+Prompts, inputs, context, outputs, judge details, and metadata may contain sensitive data. Capture only what is needed. Tracelet applies heuristic common-secret detection by default and supports custom regex patterns and path-based replacement/exclusion; it does not detect all credentials or PII. Judge callables receive the redacted event but may send it outside the process. Apply your own access, encryption, retention, and provider data-handling controls. See [privacy and security](docs/privacy.md).
 
 ## Development and verification
 
