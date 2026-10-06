@@ -40,6 +40,31 @@ class SQLiteD1Transport:
 
 
 class CloudflareD1StoreTests(unittest.TestCase):
+    def test_per_evaluator_checkpoints_survive_recovery_and_clear_on_completion(self):
+        CloudflareD1Store = public_symbol("CloudflareD1Store")
+        client = SQLiteD1Transport()
+        store = CloudflareD1Store(client=client, query_url="https://d1.example/query")
+
+        async def scenario():
+            await store.initialize()
+            await store.enqueue("slot-d1", {"request_id": "slot-d1"})
+            self.assertEqual(await store.get_evaluator_checkpoints("slot-d1"), {})
+            with self.assertRaises(KeyError):
+                await store.checkpoint_evaluator("slot-d1", "eval-0", result={"score": 1})
+
+            await store.claim("slot-d1", worker_id="worker")
+            await store.checkpoint_evaluator("slot-d1", "eval-0", result={"score": 1})
+            await store.release("slot-d1")
+            restarted = CloudflareD1Store(client=client, query_url="https://d1.example/query")
+            await restarted.initialize()
+            self.assertEqual(await restarted.get_evaluator_checkpoints("slot-d1"), {"eval-0": {"score": 1}})
+
+            await restarted.claim("slot-d1", worker_id="worker-2")
+            await restarted.complete("slot-d1", result=[])
+            self.assertEqual(await restarted.get_evaluator_checkpoints("slot-d1"), {})
+
+        asyncio.run(scenario())
+
     def test_store_persists_and_transitions_jobs_using_async_d1_queries(self):
         CloudflareD1Store = public_symbol("CloudflareD1Store")
         client = SQLiteD1Transport()

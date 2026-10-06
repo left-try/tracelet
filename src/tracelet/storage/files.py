@@ -148,6 +148,21 @@ class FileStore:
             record["result_checkpoint"] = result
             self._write(path, record)
 
+    def get_evaluator_checkpoints(self, job_id: str) -> dict[str, Any]:
+        with self._lock:
+            record = self.get(job_id)
+            return dict(record.get("evaluator_checkpoints", {})) if record else {}
+
+    def checkpoint_evaluator(self, job_id: str, evaluator_key: str, *, result: Any) -> None:
+        with self._lock:
+            path = self._path("claimed", job_id)
+            if not path.exists():
+                raise KeyError(job_id)
+            record = self._load(path)
+            checkpoints = record.setdefault("evaluator_checkpoints", {})
+            checkpoints[evaluator_key] = result
+            self._write(path, record)
+
     def complete(self, job_id: str, *, result: Any = None) -> None:
         self._transition(job_id, "completed", result=result)
 
@@ -179,6 +194,8 @@ class FileStore:
             if record is None:
                 raise KeyError(job_id)
             record.update(status=state)
+            if state in {"completed", "failed"}:
+                record.pop("evaluator_checkpoints", None)
             if updates.pop("increment_attempt", False):
                 record["attempts"] = record.get("attempts", 0) + 1
             record.update(updates)
