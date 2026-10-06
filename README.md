@@ -59,16 +59,18 @@ Start the worker once during application startup and stop it at shutdown. For Fa
 - Configurable dotted-path redaction and field exclusion before event persistence.
 - S3-compatible JSON sink and polling drain worker that accept a caller-provided client and store; synchronous clients such as boto3 run in a worker thread.
 - Optional SQLAlchemy Core storage adapter (`tracelet-evals[sql]`) for an application-owned Engine, including PostgreSQL when the application installs its DB driver.
+- Optional async Cloudflare D1 storage adapter (`tracelet-evals[d1]`) with restart recovery for a single active worker per table.
 - Full storage protocol checks for applications implementing their own database or queue adapter.
 - FileStore cleanup for old completed/failed jobs.
 
 ## Current limitations
 
 1. **Capture latency:** synchronous adapters, including `FileStore`, run in a thread so they do not block the event loop; enqueue still waits for durable completion. Thread-affine adapters should implement async methods. Setting `sync_on_event_loop = True` opts out and can block. There is no bounded volatile queue mode.
-2. **SQL operations:** `SQLAlchemyStore` uses short transactions on an application-owned Engine and creates its table by default. It is not an ORM-session adapter, does not join application transactions, and needs real PostgreSQL concurrency/restart validation before production claims.
-3. **Judge cost controls:** limits use reported `usage.cost_usd` (or `usage.cost`). Since a call's cost is unknown until it returns, one call can exceed the ceiling; later calls are skipped. This is observed-cost control, not provider-side hard spend enforcement.
-4. **NLI/model operation:** `LocalNLIClassifier` requires heavyweight optional `transformers`/`torch` dependencies and a model already downloaded or stored locally. Map labels explicitly for models with nonstandard labels. Automatic secret/PII detection and randomized pairwise order are not included.
-5. **Inspection/export:** FileStore can prune terminal records by age, but there is no query/export CLI or UI. S3 object overwrite behavior is idempotent by key, not immutable/versioned.
+2. **D1 operations:** D1 is a remote HTTP store, so each storage action adds network latency. `CloudflareD1Store.initialize()` recovers all claimed rows and therefore assumes one active process per table; it does not provide multi-worker leases. Direct Cloudflare REST access is rate-limited; use a secured Worker proxy for sustained traffic. Terminal-row retention is application-managed.
+3. **SQL operations:** `SQLAlchemyStore` uses short transactions on an application-owned Engine and creates its table by default. It is not an ORM-session adapter, does not join application transactions, and needs real PostgreSQL concurrency/restart validation before production claims.
+4. **Judge cost controls:** limits use reported `usage.cost_usd` (or `usage.cost`). Since a call's cost is unknown until it returns, one call can exceed the ceiling; later calls are skipped. This is observed-cost control, not provider-side hard spend enforcement.
+5. **NLI/model operation:** `LocalNLIClassifier` requires heavyweight optional `transformers`/`torch` dependencies and a model already downloaded or stored locally. Map labels explicitly for models with nonstandard labels. Automatic secret/PII detection and randomized pairwise order are not included.
+6. **Inspection/export:** FileStore can prune terminal records by age, but there is no query/export CLI or UI. S3 object overwrite behavior is idempotent by key, not immutable/versioned.
 
 Treat this version as a library building block to integrate and validate in your service, not as a turnkey production evaluation system.
 
@@ -111,6 +113,20 @@ Worker execution is at-least-once around crashes. An evaluator may finish and th
 S3 is a sink, not a transactional outbox. Configure `EvaluationWorker(archive_store=archive_outbox)` to checkpoint and enqueue completed evaluation records to a separate archive outbox, then run `S3DrainWorker(store=archive_outbox, sink=s3_sink)`. The evaluation store needs `checkpoint()` when archive delivery is enabled. Do not point both workers at the same pending queue, because they compete to claim each job. S3 retries use the same deterministic object key and overwrite it. A synchronous client such as boto3 is called in a worker thread. Ensure the archive adapter implements the complete storage contract.
 
 For SQL storage, install `tracelet-evals[sql]`, create an SQLAlchemy Engine with the application's database driver, then pass `SQLAlchemyStore(engine)` as the store. It uses short transactions and does not use an ORM session or join a surrounding request transaction. It creates `tracelet_jobs` unless `create_table=False` is supplied.
+
+For Cloudflare D1, install `tracelet-evals[d1]` and use the async `CloudflareD1Store`. Call `await store.initialize()` once during application startup before starting the worker; it creates the outbox table and recovers claims left by a previous process. `pending_limit` bounds rows fetched per poll (default 100). For the Cloudflare REST API, pass its full `/accounts/{account_id}/d1/database/{database_id}/query` URL and a D1 API token. For a Worker proxy using `D1Database.prepare(...).run()`, set `api_style="worker-proxy"` and pass the proxy URL. The adapter uses parameterized SQL, and query parameters are sent as strings per the D1 REST API contract. It supports a single active worker per table: initialization requeues every claimed row, so do not initialize it while another process is working that table. Cloudflare documents its REST API as control-plane-oriented and rate-limited; use a secured Worker proxy for sustained runtime traffic ([D1 external access guidance](https://developers.cloudflare.com/d1/tutorials/build-an-api-to-access-d1/)).
+
+```python
+store = CloudflareD1Store(
+    query_url=f"https://api.cloudflare.com/client/v4/accounts/{account_id}/d1/database/{database_id}/query",
+    api_token=cloudflare_d1_token,
+)
+await store.initialize()
+tracelet = Tracelet(storage=store)
+worker = EvaluationWorker(store=store, evaluator=pipeline.run)
+```
+
+If you pass your own HTTP client, Tracelet does not close it. If Tracelet creates the optional `httpx.AsyncClient`, call `await store.close()` during app shutdown. A Worker proxy must accept `{ "query": ..., "params": [...] }` and return a D1-style `{ "success": true, "results": [...] }` response when using `api_style="worker-proxy"`.
 
 For local NLI, install `tracelet-evals[local-nli]`, prepare the model on disk, and pass its path to `LocalNLIClassifier`; model downloads are disabled by default. `EvaluationPipeline(max_judge_cost=...)` applies an observed-cost cap; report `usage.cost_usd` from judge callables. `max_concurrent_judges` bounds simultaneous calls.
 
