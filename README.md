@@ -145,6 +145,20 @@ worker = EvaluationWorker(store=store, evaluator=pipeline.run)
 
 If you pass your own HTTP client, Tracelet does not close it. If Tracelet creates the optional `httpx.AsyncClient`, call `await store.close()` during app shutdown. A Worker proxy must accept `{ "query": ..., "params": [...] }` and return a D1-style `{ "success": true, "results": [...] }` response when using `api_style="worker-proxy"`.
 
+For Cloudflare D1, install `tracelet-evals[d1]` and use the async `CloudflareD1Store`. Call `await store.initialize()` once during application startup before starting the worker; it creates the outbox table and recovers claims left by a previous process. `pending_limit` bounds rows fetched per poll (default 100). For the Cloudflare REST API, pass its full `/accounts/{account_id}/d1/database/{database_id}/query` URL and a D1 API token. For a Worker proxy using `D1Database.prepare(...).run()`, set `api_style="worker-proxy"` and pass the proxy URL. The adapter uses parameterized SQL, and query parameters are sent as strings per the D1 REST API contract. It supports a single active worker per table: initialization requeues every claimed row, so do not initialize it while another process is working that table. Cloudflare documents its REST API as control-plane-oriented and rate-limited; use a secured Worker proxy for sustained runtime traffic ([D1 external access guidance](https://developers.cloudflare.com/d1/tutorials/build-an-api-to-access-d1/)).
+
+```python
+store = CloudflareD1Store(
+    query_url=f"https://api.cloudflare.com/client/v4/accounts/{account_id}/d1/database/{database_id}/query",
+    api_token=cloudflare_d1_token,
+)
+await store.initialize()
+tracelet = Tracelet(storage=store)
+worker = EvaluationWorker(store=store, evaluator=pipeline.run)
+```
+
+If you pass your own HTTP client, Tracelet does not close it. If Tracelet creates the optional `httpx.AsyncClient`, call `await store.close()` during app shutdown. A Worker proxy must accept `{ "query": ..., "params": [...] }` and return a D1-style `{ "success": true, "results": [...] }` response when using `api_style="worker-proxy"`.
+
 For local NLI, install `tracelet-evals[local-nli]`, prepare the model on disk, and pass its path to `LocalNLIClassifier`; model downloads are disabled by default. `EvaluationPipeline(max_judge_cost=...)` applies an observed-cost cap; report `usage.cost_usd` from judge callables. `max_concurrent_judges` bounds simultaneous calls.
 
 Completed and failed local records can be removed explicitly with `FileStore.prune(older_than_seconds=...)`; choose retention based on your data policy and ensure no consumer still needs those records.
