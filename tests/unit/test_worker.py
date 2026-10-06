@@ -7,6 +7,55 @@ from tests._support import public_symbol
 
 
 class WorkerTests(unittest.TestCase):
+    def test_context_aware_evaluator_result_is_reused_after_parent_checkpoint_failure(self):
+        Event = public_symbol("Event")
+        EvaluationWorker = public_symbol("EvaluationWorker")
+        FileStore = public_symbol("FileStore")
+
+        class FailTopCheckpointOnce:
+            def __init__(self, store):
+                self.store = store
+                self.failed = False
+
+            def __getattr__(self, name):
+                return getattr(self.store, name)
+
+            def checkpoint(self, job_id, *, result):
+                if not self.failed:
+                    self.failed = True
+                    raise RuntimeError("top-level checkpoint interrupted")
+                return self.store.checkpoint(job_id, result=result)
+
+        class ContextAware:
+            name = "external-check"
+            version = "1"
+
+            def __init__(self):
+                self.calls = 0
+
+            async def evaluate_with_context(self, event, *, context):
+                self.calls += 1
+                return {"score_type": "boolean", "score": True}
+
+        async def scenario(directory):
+            base = FileStore(Path(directory))
+            store = FailTopCheckpointOnce(base)
+            evaluator = ContextAware()
+            worker = EvaluationWorker(
+                store=store, evaluator=evaluator, max_attempts=3, poll_interval=0.002,
+            )
+            await worker.enqueue(Event(request_id="context-aware-retry", input="q", output="a"))
+            await worker.start()
+            await worker.wait_idle(timeout=2)
+            await worker.stop()
+            return evaluator.calls, base.get("context-aware-retry")
+
+        with tempfile.TemporaryDirectory() as directory:
+            calls, job = asyncio.run(scenario(directory))
+
+        self.assertEqual(calls, 1)
+        self.assertEqual(job["status"], "completed")
+
     def test_worker_redacts_event_results_errors_and_archive_records(self):
         Event = public_symbol("Event")
         EvaluationWorker = public_symbol("EvaluationWorker")

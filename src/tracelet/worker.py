@@ -145,6 +145,8 @@ class EvaluationWorker:
                     serialized_result = job["result_checkpoint"]
                 else:
                     contextual_target = self._contextual_target(self.evaluator)
+                    context = None
+                    cached_context_result = None
                     if "evaluators" in payload:
                         selected = []
                         for name in payload["evaluators"]:
@@ -162,13 +164,18 @@ class EvaluationWorker:
                     elif contextual_target is not None:
                         self._require_evaluator_checkpoint_store()
                         context = self._evaluation_context(job_id, "root")
-                        call = contextual_target(event, context=context)
+                        cached_context_result = await context.load_checkpoint()
+                        call = None if cached_context_result is not None else contextual_target(event, context=context)
                     else:
                         call = self.evaluator(event)
-                    if self.timeout is not None:
+                    if cached_context_result is not None:
+                        result = cached_context_result
+                    elif self.timeout is not None:
                         result = await asyncio.wait_for(call, timeout=self.timeout) if inspect.isawaitable(call) else call
                     else:
                         result = await call if inspect.isawaitable(call) else call
+                    if context is not None and cached_context_result is None:
+                        await context.save_checkpoint(_serialize_result(result))
                     if self.candidate_runner is not None:
                         comparison = await self.candidate_runner.run(event)
                         pairwise = []
